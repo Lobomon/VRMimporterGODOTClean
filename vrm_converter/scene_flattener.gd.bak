@@ -1,0 +1,431 @@
+@tool
+## SceneFlattener v4
+##
+## Problema raíz identificado: PackedScene.pack() embebe recursos inline cuando
+## sus UIDs no están registrados en la base de datos ResourceUID del editor.
+## Los recursos que guardamos con ResourceSaver.save() tienen resource_path pero
+## NO tienen UID registrado → Godot no los reconoce como recursos del proyecto
+## y los serializa inline dentro del .tscn → archivo de 400 MB.
+##
+## Solución: después de cada ResourceSaver.save(), registrar el UID del recurso
+## en ResourceUID con ResourceUID.add_id() antes de hacer el load() de vuelta.
+## Con UID válido, PackedScene.pack() los trata como externos y solo guarda
+## la referencia (path + uid), no el contenido.
+
+extends RefCounted
+
+const SAVE_WEBP_DEBUG := false
+
+var base_path: String = ""
+
+var _mesh_idx: int = 0
+var _skin_idx: int = 0
+var _mat_idx:  int = 0
+var _tex_idx:  int = 0
+var _lib_idx:  int = 0
+
+var _tex_cache: Dictionary = {}
+
+var _out_dir:    String = ""
+var _model_name: String = ""
+
+const VRM_METADATA_KEYS := [
+	"spring_bones", "collider_groups", "vrm_pose_diffs",
+	"vrm_meta", "vrm_secondary", "gltf_node_index",
+	"thumbnail",
+]
+
+# Claves de metadata que NO deben eliminarse aunque sean recursos sin path
+const PROTECTED_META_KEYS := [
+	"humanoid_bone_mapping",
+	"humanBones",
+]
+
+
+func flatten(source: Node) -> Node:
+	if source == null:
+		return null
+	if base_path == "":
+		push_error("[VRM Converter] SceneFlattener: base_path no definido")
+		return null
+
+	_model_name = base_path.get_file()
+	_out_dir    = base_path.get_base_dir().path_join(_model_name) + "/"
+
+	var abs_dir := ProjectSettings.globalize_path(_out_dir)
+	if not DirAccess.dir_exists_absolute(abs_dir):
+		var err := DirAccess.make_dir_recursive_absolute(abs_dir)
+		if err != OK:
+			push_error("[VRM Converter] No se pudo crear carpeta: %s (err=%d)" % [abs_dir, err])
+			return null
+
+	print("[VRM Converter] Carpeta de salida: ", _out_dir)
+
+	var flags: int = (
+		Node.DUPLICATE_SIGNALS |
+		Node.DUPLICATE_GROUPS  |
+		Node.DUPLICATE_SCRIPTS
+	)
+	var copy: Node = source.duplicate(flags)
+	if copy == null:
+		push_error("[VRM Converter] SceneFlattener: duplicate() returned null")
+		return null
+
+	_reassign_owners(copy, copy)
+	_strip_vrm_metadata(copy)
+	_process_resources(copy)
+
+	return copy
+
+
+## resolve_textures: no-op, mantenido por compatibilidad con el llamador.
+func resolve_textures(_node: Node) -> void:
+	pass
+
+
+# ─── Helper central de guardado ───────────────────────────────────────────────
+## Guarda `res` en `path`, registra su UID en ResourceUID, y devuelve el recurso
+## recargado desde disco. Con UID registrado, PackedScene.pack() lo trata como
+## recurso externo (solo guarda la referencia) en lugar de embeber el contenido.
+
+func _save_res(res: Resource, path: String) -> Resource:
+	# Guardar con take_over_path(path) para que el UID quede en el header del .res
+	res.take_over_path(path)
+	var err := ResourceSaver.save(res, path, ResourceSaver.FLAG_COMPRESS)
+	if err != OK:
+		push_error("[VRM Converter] ResourceSaver.save() falló: %s (err=%d)" % [path, err])
+		return res
+
+	if Engine.is_editor_hint():
+		_register_uid_and_force_external(path)
+	
+	# Reload fuerte
+	return ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE) as Resource
+
+
+# ─── Owner reassignment ───────────────────────────────────────────────────────
+
+func _reassign_owners(root: Node, node: Node) -> void:
+	for child in node.get_children():
+		if child.owner == null:
+			child.owner = root
+		_reassign_owners(root, child)
+
+
+# ─── Limpieza de metadata VRM ─────────────────────────────────────────────────
+
+func _strip_vrm_metadata(node: Node) -> void:
+	for key in node.get_meta_list():
+		var val: Variant = node.get_meta(key)
+
+		# --- Caso 1: Es una ImageTexture directamente ---
+		if val is ImageTexture:
+			print("[VRM Converter] Eliminando metadata ImageTexture: ", key)
+			node.remove_meta(key)
+			continue
+
+		# --- Caso 2: Es un array ---
+		if val is Array:
+			var arr := val as Array
+			var has_image_texture := false
+			for item in arr:
+				if item is ImageTexture:
+					has_image_texture = true
+					break
+			if has_image_texture:
+				print("[VRM Converter] Eliminando metadata Array con ImageTexture: ", key)
+				node.remove_meta(key)
+				continue
+
+		# --- Caso 3: Es un recurso que no es ImageTexture ---
+		# Lo dejamos sin eliminar, aunque sea sin path, porque puede ser necesario para el retargeter.
+		# (ejemplo: recursos de spring bones, humanoid mapping, etc.)
+
+		# NOTA: Si quieres depurar qué metadatos se conservan, descomenta:
+		# if val is Resource and (val as Resource).resource_path == "":
+		#     print("[VRM Converter] Conservando metadata Resource sin path: ", key)
+
+	for child in node.get_children():
+		_strip_vrm_metadata(child)
+
+
+# ─── Procesado recursivo ──────────────────────────────────────────────────────
+
+func _process_resources(node: Node) -> void:
+	# Primero, externalizar recursos en propiedades directas del nodo
+	_externalise_node_resources(node)
+
+	if node is MeshInstance3D:
+		_process_mesh_instance(node as MeshInstance3D)
+	elif node is AnimationPlayer:
+		_process_animation_player(node as AnimationPlayer)
+
+	for child in node.get_children():
+		_process_resources(child)
+
+
+# ─── Externalizar recursos en propiedades directas de cualquier nodo ──────────
+
+func _externalise_node_resources(node: Node) -> void:
+	var props := node.get_property_list()
+	for p in props:
+		if not (p.usage & PROPERTY_USAGE_STORAGE):
+			continue
+		if p.type == TYPE_OBJECT and p.class_name != "":
+			var value = node.get(p.name)
+			if value == null:
+				continue
+			if value is Texture2D:
+				# Si es thumbnail, lo borramos directamente (no queremos guardarlo)
+				if p.name.to_lower() == "thumbnail":
+					node.set(p.name, null)
+					print("[VRM Converter] Thumbnail eliminado de propiedad: ", p.name)
+					continue
+				# En caso contrario, externalizamos normalmente
+				var new_val = _externalise_texture(value)
+				if new_val != value:
+					node.set(p.name, new_val)
+			elif value is Material:
+				var new_val = _externalise_material(value)
+				if new_val != value:
+					node.set(p.name, new_val)
+			# Podríamos añadir Mesh, Skin, etc., pero ya se manejan en MeshInstance3D.
+
+
+# ─── MeshInstance3D ───────────────────────────────────────────────────────────
+
+func _process_mesh_instance(mi: MeshInstance3D) -> void:
+	# 1. Externalizar materiales en surface slots del mesh
+	if mi.mesh != null:
+		for i in range(mi.mesh.get_surface_count()):
+			var mat: Material = mi.mesh.surface_get_material(i)
+			if mat != null:
+				var saved := _externalise_material(mat)
+				if saved != null and saved != mat:
+					mi.mesh.surface_set_material(i, saved)
+
+	# 2. Externalizar el mesh
+	if mi.mesh != null:
+		var mesh_path := _out_dir + "%s_mesh_%d.tres" % [_model_name, _mesh_idx]
+		_mesh_idx += 1
+		var mesh_copy: Mesh = mi.mesh.duplicate(true)
+		var loaded := _save_res(mesh_copy, mesh_path)
+		if loaded is Mesh:
+			mi.mesh = loaded as Mesh
+
+	# 3. Externalizar la skin
+	if mi.skin != null:
+		var skin_path := _out_dir + "%s_skin_%d.tres" % [_model_name, _skin_idx]
+		_skin_idx += 1
+		var skin_copy: Skin = mi.skin.duplicate(true)
+		var loaded := _save_res(skin_copy, skin_path)
+		if loaded is Skin:
+			mi.skin = loaded as Skin
+
+	# 4. Externalizar surface override materials
+	if mi.mesh != null:
+		for i in range(mi.mesh.get_surface_count()):
+			var mat: Material = mi.get_surface_override_material(i)
+			if mat != null:
+				var saved := _externalise_material(mat)
+				if saved != null and saved != mat:
+					mi.set_surface_override_material(i, saved)
+
+
+# ─── Material ─────────────────────────────────────────────────────────────────
+
+func _externalise_material(mat: Material) -> Material:
+	if mat == null:
+		return null
+	if mat.resource_path != "" and not _is_inline_path(mat.resource_path):
+		return mat
+
+	# Primero externalizar las texturas dentro del material
+	if mat is StandardMaterial3D:
+		_externalise_standard_textures(mat as StandardMaterial3D)
+	elif mat is ShaderMaterial:
+		_externalise_shader_textures(mat as ShaderMaterial)
+
+	var mat_path := _out_dir + "%s_mat_%d.tres" % [_model_name, _mat_idx]
+	_mat_idx += 1
+	var loaded := _save_res(mat, mat_path)
+	if loaded is Material:
+		return loaded as Material
+	return mat
+
+
+func _externalise_standard_textures(mat: StandardMaterial3D) -> void:
+	var props := [
+		"albedo_texture", "metallic_texture", "roughness_texture",
+		"emission_texture", "normal_texture", "rim_texture",
+		"clearcoat_texture", "anisotropy_flowmap", "ambient_occlusion_texture",
+		"heightmap_texture", "subsurf_scatter_texture",
+		"subsurf_scatter_transmittance_texture", "backlight_texture",
+		"refraction_texture", "detail_mask", "detail_albedo", "detail_normal",
+	]
+	for prop in props:
+		var tex: Variant = mat.get(prop)
+		if tex is Texture2D:
+			var saved := _externalise_texture(tex as Texture2D)
+			if saved != null and saved != tex:
+				mat.set(prop, saved)
+
+
+func _externalise_shader_textures(mat: ShaderMaterial) -> void:
+	if mat.shader == null:
+		return
+	for param in mat.shader.get_shader_uniform_list():
+		var val: Variant = mat.get_shader_parameter(param["name"])
+		if val is Texture2D:
+			var saved := _externalise_texture(val as Texture2D)
+			if saved != null and saved != val:
+				mat.set_shader_parameter(param["name"], saved)
+
+
+# ─── Textura ──────────────────────────────────────────────────────────────────
+
+func _externalise_texture(tex: Texture2D) -> Texture2D:
+	if tex == null:
+		return null
+
+	var cache_key: int = tex.get_instance_id()
+	if _tex_cache.has(cache_key):
+		return _tex_cache[cache_key]
+
+	# Textura ya en disco con path real y no inline
+	var rpath := tex.resource_path
+	if rpath != "" and not _is_inline_path(rpath):
+		# Si es una CompressedTexture2D importada (ej. desde .png), copiarla
+		# a nuestra carpeta como PortableCompressedTexture2D con UID registrado.
+		# Esto evita que PackedScene la embeba inline por falta de UID en el context.
+		if tex is CompressedTexture2D:
+			var img := _get_image(tex)
+			if img != null and not img.is_empty():
+				# Reusar el mismo nombre de archivo pero en nuestra carpeta
+				var fname := rpath.get_file().get_basename()
+				var tex_path := _out_dir + "%s_%s.tres" % [_model_name, fname]
+				# Evitar duplicados: si ya existe en cache por path, reusar
+				if _tex_cache.has(rpath):
+					_tex_cache[cache_key] = _tex_cache[rpath]
+					return _tex_cache[cache_key]
+				if img.get_format() != Image.FORMAT_RGBA8 and img.get_format() != Image.FORMAT_RGB8:
+					img.convert(Image.FORMAT_RGBA8)
+				var pct := PortableCompressedTexture2D.new()
+				pct.create_from_image(img, PortableCompressedTexture2D.COMPRESSION_MODE_BASIS_UNIVERSAL)
+				pct.resource_name = fname
+				var loaded := _save_res(pct, tex_path)
+				if loaded is Texture2D:
+					_tex_cache[cache_key] = loaded as Texture2D
+					_tex_cache[rpath] = loaded as Texture2D
+					return loaded as Texture2D
+		# Para cualquier otro tipo con path externo: registrar UID y devolver
+		_ensure_uid(rpath)
+		_tex_cache[cache_key] = tex
+		return tex
+
+	# Extraer Image cruda
+	var img: Image = _get_image(tex)
+
+	if img == null or img.is_empty():
+		# Sin imagen y sin path externo → no hay nada que hacer
+		push_error("[VRM Converter] No se pudo extraer imagen de: %s (%s)" % [
+			rpath, tex.get_class()])
+		_tex_cache[cache_key] = tex
+		return tex
+
+	if SAVE_WEBP_DEBUG:
+		var webp_path := _out_dir + "%s_tex_%d_debug.webp" % [_model_name, _tex_idx]
+		img.save_webp(ProjectSettings.globalize_path(webp_path), false)
+
+	# Convertir formato si es necesario para BASIS_UNIVERSAL
+	if img.get_format() != Image.FORMAT_RGBA8 and img.get_format() != Image.FORMAT_RGB8:
+		img.convert(Image.FORMAT_RGBA8)
+
+	var pct := PortableCompressedTexture2D.new()
+	pct.create_from_image(img, PortableCompressedTexture2D.COMPRESSION_MODE_BASIS_UNIVERSAL)
+	pct.resource_name = tex.resource_name if tex.resource_name != "" else ("tex_%d" % _tex_idx)
+
+	var tex_path := _out_dir + "%s_tex_%d.tres" % [_model_name, _tex_idx]
+	_tex_idx += 1
+
+	var loaded := _save_res(pct, tex_path)
+	if loaded is Texture2D:
+		_tex_cache[cache_key] = loaded as Texture2D
+		return loaded as Texture2D
+
+	_tex_cache[cache_key] = tex
+	return tex
+
+
+func _get_image(tex: Texture2D) -> Image:
+	if tex is ImageTexture:
+		return (tex as ImageTexture).get_image()
+	if tex is PortableCompressedTexture2D:
+		return (tex as PortableCompressedTexture2D).get_image()
+	if tex.has_method("get_image"):
+		var result = tex.call("get_image")
+		if result is Image:
+			return result
+	return null
+
+
+## Registra el UID de un recurso ya en disco si aún no está en la base de datos.
+func _ensure_uid(res_path: String) -> void:
+	var uid_db := ResourceUID
+	# Intentar obtener el UID actual del path
+	var existing_uid: int = uid_db.text_to_id(res_path) if uid_db.has_method("text_to_id") else ResourceUID.INVALID_ID
+	if existing_uid != ResourceUID.INVALID_ID:
+		return  # Ya tiene UID registrado
+	# Generar y registrar uno nuevo
+	var new_uid: int = uid_db.create_id()
+	uid_db.add_id(new_uid, res_path)
+
+
+# ─── AnimationPlayer ──────────────────────────────────────────────────────────
+
+func _process_animation_player(ap: AnimationPlayer) -> void:
+	for lib_name in ap.get_animation_library_list():
+		var lib: AnimationLibrary = ap.get_animation_library(lib_name)
+		if lib == null:
+			continue
+		var lib_copy := AnimationLibrary.new()
+		for anim_name in lib.get_animation_list():
+			var anim: Animation = lib.get_animation(anim_name)
+			if anim:
+				var anim_copy: Animation = anim.duplicate(true)
+				anim_copy.take_over_path("")
+				lib_copy.add_animation(anim_name, anim_copy)
+		var safe_name := lib_name.replace("/", "_").replace(":", "_")
+		if safe_name == "":
+			safe_name = str(_lib_idx)
+		var lib_path := _out_dir + "%s_anims_%s.tres" % [_model_name, safe_name]
+		_lib_idx += 1
+		var loaded := _save_res(lib_copy, lib_path)
+		if loaded is AnimationLibrary:
+			ap.remove_animation_library(lib_name)
+			ap.add_animation_library(lib_name, loaded as AnimationLibrary)
+
+
+# ─── Helper ───────────────────────────────────────────────────────────────────
+
+func _is_inline_path(path: String) -> bool:
+	return ".godot/imported" in path or "::" in path or path == ""
+
+func _register_uid_and_force_external(path: String) -> void:
+	if path == "" or not ResourceLoader.exists(path):
+		return
+	
+	# 1. Intentar obtener el UID actual (si ya existe)
+	var uid: int = ResourceUID.text_to_id("uid://" + path)  # formato que usa Godot internamente
+	
+	if uid == ResourceUID.INVALID_ID:
+		# No tiene UID → creamos uno nuevo y lo asociamos
+		uid = ResourceUID.create_id()
+		ResourceUID.add_id(uid, path)
+		print("[VRM Converter] UID nuevo registrado para: ", path, " → ", uid)
+	else:
+		print("[VRM Converter] Ya tenía UID: ", uid, " para ", path)
+	
+	# 2. Forzar refresh del filesystem (importante en @tool)
+	if Engine.is_editor_hint():
+		EditorInterface.get_resource_filesystem().update_file(path)
