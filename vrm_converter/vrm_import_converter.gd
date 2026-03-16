@@ -4,6 +4,7 @@ extends EditorSceneFormatImporter
 const MaterialConverter   = preload("res://addons/vrm_converter/material_converter.gd")
 const SceneFlattener      = preload("res://addons/vrm_converter/scene_flattener.gd")
 const SkeletonRetargeter  = preload("res://addons/vrm_converter/skeleton_retargeter.gd")
+const VRMUtils            = preload("res://addons/vrm/vrm_utils.gd")
 
 
 func _get_importer_name() -> String:
@@ -30,6 +31,12 @@ func _get_options(_path: String) -> Array[Dictionary]:
 		{ "name": "vrm/head_hiding_method",                   "default_value": 0,     "property_hint": PROPERTY_HINT_ENUM, "hint_string": "ThirdPersonOnly,FirstPersonOnly,FirstWithShadow,Layers,LayersWithShadow,IgnoreHeadHiding", "usage": PROPERTY_USAGE_DEFAULT },
 		{ "name": "vrm/only_if_head_hiding_uses_layers/first_person_layers", "default_value": 2, "property_hint": PROPERTY_HINT_LAYERS_3D_RENDER, "hint_string": "", "usage": PROPERTY_USAGE_DEFAULT },
 		{ "name": "vrm/only_if_head_hiding_uses_layers/third_person_layers", "default_value": 4, "property_hint": PROPERTY_HINT_LAYERS_3D_RENDER, "hint_string": "", "usage": PROPERTY_USAGE_DEFAULT },
+		# NUEVA OPCIÓN: Forzar T-Pose en rest pose (corrige modelos VRoid)
+		{ "name": "vrm_converter/force_t_pose", 
+		  "default_value": true, 
+		  "property_hint": PROPERTY_HINT_NONE, 
+		  "hint_string": "Forzar T-Pose en rest pose (arregla brazos desviados VRoid)", 
+		  "usage": PROPERTY_USAGE_DEFAULT },
 	]
 
 
@@ -67,6 +74,42 @@ func _import_scene(path: String, flags: int, options: Dictionary) -> Object:
 		push_error("[VRM Converter] generate_scene() returned null")
 		return null
 
+	# Si el plugin oficial no ha renombrado a GeneralSkeleton (caso VRM 1.0 / VRoid nuevo),
+	# forzamos el mismo flujo de skeleton_rename construyendo un BoneMap compatible.
+	print("[VRM Converter] Escena VRM generada, comprobando esqueleto para VRM 1.0…")
+	var retargeter := SkeletonRetargeter.new()
+	var imported_skeleton: Skeleton3D = retargeter.find_skeleton(scene)
+	if imported_skeleton == null:
+		print("[VRM Converter] No se encontró Skeleton3D en la escena importada.")
+	else:
+		print("[VRM Converter] Skeleton encontrado: %s (bones=%d)" % [imported_skeleton.name, imported_skeleton.get_bone_count()])
+		var is_v1_meta: bool = retargeter.is_vrm_1_0(scene)
+		var is_v1_heuristic: bool = retargeter.looks_like_vrm1_vroid_skeleton(imported_skeleton)
+		print("[VRM Converter] ¿VRM 1.0 por meta?: %s, ¿por huesos VRoid?: %s" % [str(is_v1_meta), str(is_v1_heuristic)])
+		if imported_skeleton.name != SkeletonRetargeter.GENERAL_SKELETON_NAME and (is_v1_meta or is_v1_heuristic):
+			print("[VRM Converter] Intentando forzar retarget completo VRM 1.0 (meta/heurística)…")
+			var bone_map: BoneMap = retargeter.build_vrm1_bone_map_from_gltf_state(state, imported_skeleton)
+			if bone_map:
+				print("[VRM Converter] BoneMap generado, llamando a VRMUtils.perform_retarget…")
+				VRMUtils.perform_retarget(state, scene, imported_skeleton, bone_map)
+				print("[VRM Converter] perform_retarget terminado. Nombre de esqueleto: %s" % imported_skeleton.name)
+				# Loguear algunos huesos para verificar el renombrado real.
+				var max_log_bones := min(20, imported_skeleton.get_bone_count())
+				for i in range(max_log_bones):
+					print("[VRM Converter] Bone[%d]: %s" % [i, imported_skeleton.get_bone_name(i)])
+				# Loguear dónde están los AnimationPlayer en la escena resultante.
+				print("[VRM Converter] Buscando AnimationPlayer en la escena importada…")
+				var stack: Array[Node] = [scene]
+				while not stack.is_empty():
+					var n: Node = stack.pop_back()
+					if n is AnimationPlayer:
+						print("[VRM Converter] AnimationPlayer encontrado en ruta: %s" % str(n.get_path()))
+					for child in n.get_children():
+						if child is Node:
+							stack.append(child)
+			else:
+				push_warning("[VRM Converter] No se pudo generar un BoneMap VRM 1.0 válido.")
+
 	var do_glb:  bool = options.get("vrm_converter/export_glb", true)
 	var do_tscn: bool = options.get("vrm_converter/export_tscn", true)
 
@@ -78,6 +121,8 @@ func _import_scene(path: String, flags: int, options: Dictionary) -> Object:
 		helper.keep_mtoon            = options.get("vrm_converter/keep_mtoon_shader", true)
 		helper.gen_standard_fallback = options.get("vrm_converter/generate_standard_fallback", true)
 		helper.source_scene          = scene
+		# Pasar todas las opciones para que el retargeter pueda usarlas
+		helper.options               = options
 		EditorInterface.get_base_control().add_child(helper)
 		helper.call_deferred("run")
 
@@ -91,6 +136,7 @@ class _DeferredExporter extends Node:
 	var keep_mtoon:            bool
 	var gen_standard_fallback: bool
 	var source_scene:          Node
+	var options:               Dictionary        # NUEVO: guardar opciones
 
 
 	func run() -> void:
@@ -134,8 +180,8 @@ class _DeferredExporter extends Node:
 		var model_name := base_path.get_file()
 		var tscn_path  := base_path.get_base_dir().path_join(model_name).path_join(model_name + "_converted.tscn")
 
+		# NUEVO: pasar options al retargeter
 		var retargeter := SkeletonRetargeter.new()
-		retargeter.process(scene, base_path)
 
 		var flattener       := SceneFlattener.new()
 		flattener.base_path = base_path
